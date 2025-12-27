@@ -7,11 +7,42 @@ import { spawn } from "child_process";
 import ffmpegPath from "ffmpeg-static";
 import { nanoid } from "nanoid";
 import { createClient } from "@supabase/supabase-js";
+import cors from "cors";
 
 import { makeBatchCaptions } from "./captions.js";
 import { toCsv } from "./csv.js";
 
 const app = express();
+const allowedOrigins = [
+  "https://europepush.com",
+];
+
+const base44Regex = /^https:\/\/preview-sandbox--.*\.base44\.app$/;
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow server-to-server & tools like curl/postman
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      if (base44Regex.test(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("CORS not allowed"), false);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+// Handle preflight
+app.options("*", cors());
 
 const PORT = process.env.PORT || 10000;
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "https://europepush.com";
@@ -28,18 +59,6 @@ const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
   : null;
 
-// ---- very small CORS (Base44 -> backend)
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin === FRONTEND_ORIGIN) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  }
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
 
 // Health
 app.get("/", (req, res) => res.json({ ok: true, service: "content-molle" }));
