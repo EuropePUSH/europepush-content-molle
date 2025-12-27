@@ -8,8 +8,8 @@ import ffmpegPath from "ffmpeg-static";
 import { nanoid } from "nanoid";
 import { createClient } from "@supabase/supabase-js";
 
-import { makeBatchCaptions } from "./src/captions.js";
-import { toCsv } from "./src/csv.js";
+import { makeBatchCaptions } from "./captions.js";
+import { toCsv } from "./csv.js";
 
 const app = express();
 
