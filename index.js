@@ -561,6 +561,8 @@ async function uploadFileStreamToSupabase(objectPath, filePath, contentType) {
       "content-type": contentType,
       "x-upsert": "true",
     },
+    // Node 18+ (undici) requires duplex when streaming request bodies
+    duplex: "half",
     body: stream,
   });
 
