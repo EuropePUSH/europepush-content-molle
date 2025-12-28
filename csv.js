@@ -6,15 +6,21 @@ function escapeCsv(v) {
   return s;
 }
 
+// Metricool CSV format:
+// Column A: Text
+// Column B: Images/Videos (URL)
 export function toCsv(results) {
-  const header = ["video", "caption", "hashtags"].join(",");
+  const header = ["text", "media"].join(",");
+
   const rows = results.map(r => {
     const hashtags = (r.hashtags || []).join(" ");
+    const text = [r.caption, hashtags].filter(Boolean).join("\n\n");
+
     return [
-      escapeCsv(r.output_url),
-      escapeCsv(r.caption),
-      escapeCsv(hashtags)
+      escapeCsv(text),
+      escapeCsv(r.output_url)
     ].join(",");
   });
+
   return [header, ...rows].join("\n");
 }
