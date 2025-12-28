@@ -15,6 +15,11 @@ import { toCsv } from "./csv.js";
 
 const app = express();
 
+app.use((req, res, next) => {
+  console.log(`[REQ] ${req.method} ${req.path}`);
+  next();
+});
+
 app.use(express.json({ limit: "2mb" }));
 
 const UPLOADS_DIR = path.join(os.tmpdir(), "content-molle-uploads");
@@ -191,6 +196,12 @@ app.post("/molle-from-storage", async (req, res) => {
 
     const body = req.body || {};
     const paths = Array.isArray(body.paths) ? body.paths : [];
+
+    console.log(
+      "[/molle-from-storage] received paths:",
+      paths.length,
+      paths[0]
+    );
 
     if (!paths.length)
       return res.status(400).json({ ok: false, error: "no_paths_provided" });
