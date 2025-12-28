@@ -507,9 +507,9 @@ async function processOneJob(job) {
 
   // Cleanup temp dir (best effort)
   try {
-    await fs.rmdir(tmpDir, { recursive: true });
+    await fs.rm(tmpDir, { recursive: true, force: true });
   } catch {}
-});
+}
 
 async function downloadFromSupabaseInputs(objectPath, destPath) {
   const { data, error } = await supabase.storage
