@@ -287,10 +287,18 @@ app.post("/molle", upload.array("videos", 20), async (req, res) => {
   }
 });
 
-// ---- Alternative endpoint: enqueue processing of already-uploaded files from Supabase Storage (browser uploads directly)
+// ---- Alternative endpoint: process already-uploaded files from Supabase Storage (browser uploads directly)
 // Body: { paths: string[], noCaptionMode?: boolean|string, level?: string, theme?: string }
 app.post("/molle-from-storage", async (req, res) => {
   try {
+    if (!tryAcquireBatch()) {
+      return res.status(429).json({
+        ok: false,
+        error: "busy",
+        message: "Server is processing another batch. Try again in a moment.",
+      });
+    }
+
     if (!supabase)
       return res
         .status(500)
@@ -313,7 +321,7 @@ app.post("/molle-from-storage", async (req, res) => {
 
     const batchId = `batch_${nanoid(10)}`;
 
-    createJob({
+    const job = createJob({
       batchId,
       payload: {
         paths: paths.slice(0, maxCount),
@@ -323,20 +331,29 @@ app.post("/molle-from-storage", async (req, res) => {
       },
     });
 
-    enqueueJob(batchId);
+    // Run synchronously (frontend expects completed payload; no polling)
+    await processOneJob(job);
 
-    // Return immediately (no long-running request)
-    return res.status(202).json({
+    return res.json({
       ok: true,
-      batchId,
-      status: "queued",
-      message: "Batch queued for processing",
+      batchId: job.batchId,
+      level: job.level,
+      noCaptionMode: job.noCaptionMode,
+      theme: job.theme,
+      count: job.count,
+      csv_url: job.csv_url,
+      zip_url: job.zip_url,
+      results: job.results,
+      errors: job.errors,
+      status: job.status,
     });
   } catch (err) {
-    console.error("[/molle-from-storage] enqueue error:", err);
+    console.error("[/molle-from-storage] error:", err);
     return res
       .status(500)
       .json({ ok: false, error: "internal_error", message: err.message });
+  } finally {
+    releaseBatch();
   }
 });
 
@@ -553,12 +570,15 @@ async function uploadFileStreamToSupabase(objectPath, filePath, contentType) {
 
   const stream = fssync.createReadStream(filePath);
 
+  const stat = await fs.stat(filePath);
+
   const resp = await fetch(url, {
-    method: "POST",
+    method: "PUT",
     headers: {
       apikey: SUPABASE_SERVICE_ROLE_KEY,
       authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
       "content-type": contentType,
+      "content-length": String(stat.size),
       "x-upsert": "true",
     },
     // Node 18+ (undici) requires duplex when streaming request bodies
