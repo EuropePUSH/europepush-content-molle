@@ -15,6 +15,8 @@ import { toCsv } from "./csv.js";
 
 const app = express();
 
+app.use(express.json({ limit: "2mb" }));
+
 const UPLOADS_DIR = path.join(os.tmpdir(), "content-molle-uploads");
 await fs.mkdir(UPLOADS_DIR, { recursive: true });
 
@@ -46,6 +48,7 @@ const PORT = process.env.PORT || 10000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "outputs";
+const SUPABASE_INPUT_BUCKET = process.env.SUPABASE_INPUT_BUCKET || "inputs";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.warn("[WARN] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
@@ -176,6 +179,115 @@ app.post("/molle", upload.array("videos", 20), async (req, res) => {
       .json({ ok: false, error: "internal_error", message: err.message });
   }
 });
+
+// ---- Alternative endpoint: process already-uploaded files from Supabase Storage (browser uploads directly)
+// Body: { paths: string[], noCaptionMode?: boolean|string, level?: string, theme?: string }
+app.post("/molle-from-storage", async (req, res) => {
+  try {
+    if (!supabase)
+      return res
+        .status(500)
+        .json({ ok: false, error: "supabase_not_configured" });
+
+    const body = req.body || {};
+    const paths = Array.isArray(body.paths) ? body.paths : [];
+
+    if (!paths.length)
+      return res.status(400).json({ ok: false, error: "no_paths_provided" });
+
+    const maxCount = Math.min(paths.length, 20);
+
+    const noCaptionMode = body.noCaptionMode === true || body.noCaptionMode === "true";
+    const level = body.level || "1";
+    const theme = (body.theme || "snus").trim();
+
+    const batchId = `batch_${nanoid(10)}`;
+    const tmpDir = path.join(os.tmpdir(), batchId);
+    await fs.mkdir(tmpDir, { recursive: true });
+
+    const captionsPack = makeBatchCaptions({
+      count: maxCount,
+      noCaptionMode,
+      theme,
+    });
+
+    const results = [];
+
+    for (let i = 0; i < maxCount; i++) {
+      const storagePath = String(paths[i] || "").trim();
+      if (!storagePath)
+        return res.status(400).json({ ok: false, error: "invalid_path", idx: i });
+
+      const inputPath = path.join(tmpDir, `in_${i}.mp4`);
+      const outPath = path.join(tmpDir, `out_${i}.mp4`);
+
+      // Download from Supabase inputs bucket -> disk
+      await downloadFromSupabaseInputs(storagePath, inputPath);
+
+      // Process -> disk
+      await runFfmpegLevel1({ inputPath, outPath });
+
+      // Upload output -> outputs bucket
+      const outBuf = await fs.readFile(outPath);
+      const objectPath = `batches/${batchId}/clip_${String(i + 1).padStart(2, "0")}.mp4`;
+      const publicUrl = await uploadToSupabase(objectPath, outBuf, "video/mp4");
+
+      const cap = captionsPack.items[i];
+      results.push({
+        idx: i,
+        input_name: path.basename(storagePath),
+        input_path: storagePath,
+        output_url: publicUrl,
+        caption: cap.caption,
+        hashtags: cap.hashtags,
+      });
+
+      // Cleanup temp files
+      try { await fs.unlink(inputPath); } catch {}
+      try { await fs.unlink(outPath); } catch {}
+    }
+
+    const csv = toCsv(results);
+    const csvPath = `batches/${batchId}/captions.csv`;
+    const csvUrl = await uploadToSupabase(
+      csvPath,
+      Buffer.from(csv, "utf8"),
+      "text/csv"
+    );
+
+    return res.json({
+      ok: true,
+      batchId,
+      level,
+      noCaptionMode,
+      theme,
+      count: results.length,
+      csv_url: csvUrl,
+      zip_url: null,
+      results,
+    });
+  } catch (err) {
+    console.error("[/molle-from-storage] error:", err);
+    res
+      .status(500)
+      .json({ ok: false, error: "internal_error", message: err.message });
+  }
+});
+
+async function downloadFromSupabaseInputs(objectPath, destPath) {
+  const { data, error } = await supabase.storage
+    .from(SUPABASE_INPUT_BUCKET)
+    .download(objectPath);
+
+  if (error) throw error;
+  if (!data) throw new Error("supabase_download_no_data");
+
+  // data is a Blob in Node; convert to Buffer
+  const ab = await data.arrayBuffer();
+  const buf = Buffer.from(ab);
+
+  await fs.writeFile(destPath, buf);
+}
 
 async function uploadToSupabase(objectPath, buffer, contentType) {
   const { error } = await supabase.storage
