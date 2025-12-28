@@ -5,6 +5,8 @@ import os from "os";
 import path from "path";
 import fs from "fs/promises";
 import fssync from "fs";
+import { pipeline } from "stream/promises";
+import { createWriteStream } from "fs";
 import { spawn } from "child_process";
 import ffmpegPath from "ffmpeg-static";
 import { nanoid } from "nanoid";
@@ -226,6 +228,7 @@ app.post("/molle-from-storage", async (req, res) => {
 
     for (let i = 0; i < maxCount; i++) {
       const storagePath = String(paths[i] || "").trim();
+      console.log(`[molle-from-storage] (${i + 1}/${maxCount}) start`, storagePath);
       if (!storagePath)
         return res.status(400).json({ ok: false, error: "invalid_path", idx: i });
 
@@ -233,15 +236,18 @@ app.post("/molle-from-storage", async (req, res) => {
       const outPath = path.join(tmpDir, `out_${i}.mp4`);
 
       // Download from Supabase inputs bucket -> disk
-      await downloadFromSupabaseInputs(storagePath, inputPath);
+      await withTimeout(downloadFromSupabaseInputs(storagePath, inputPath), 120000, "download_timeout");
+      console.log(`[molle-from-storage] (${i + 1}/${maxCount}) downloaded ->`, inputPath);
 
       // Process -> disk
-      await runFfmpegLevel1({ inputPath, outPath });
+      await withTimeout(runFfmpegLevel1({ inputPath, outPath }), 180000, "ffmpeg_timeout");
+      console.log(`[molle-from-storage] (${i + 1}/${maxCount}) ffmpeg done ->`, outPath);
 
       // Upload output -> outputs bucket
       const outBuf = await fs.readFile(outPath);
       const objectPath = `batches/${batchId}/clip_${String(i + 1).padStart(2, "0")}.mp4`;
-      const publicUrl = await uploadToSupabase(objectPath, outBuf, "video/mp4");
+      const publicUrl = await withTimeout(uploadToSupabase(objectPath, outBuf, "video/mp4"), 120000, "upload_timeout");
+      console.log(`[molle-from-storage] (${i + 1}/${maxCount}) uploaded ->`, publicUrl);
 
       const cap = captionsPack.items[i];
       results.push({
@@ -293,10 +299,15 @@ async function downloadFromSupabaseInputs(objectPath, destPath) {
   if (error) throw error;
   if (!data) throw new Error("supabase_download_no_data");
 
-  // data is a Blob in Node; convert to Buffer
+  // In Node, Supabase returns a Blob. Stream it to disk to avoid RAM spikes.
+  if (typeof data.stream === "function") {
+    await pipeline(data.stream(), createWriteStream(destPath));
+    return;
+  }
+
+  // Fallback (should rarely happen)
   const ab = await data.arrayBuffer();
   const buf = Buffer.from(ab);
-
   await fs.writeFile(destPath, buf);
 }
 
@@ -359,6 +370,15 @@ function runFfmpegLevel1({ inputPath, outPath }) {
       reject(new Error(`ffmpeg_failed code=${code}\n${stderr.slice(-3000)}`));
     });
   });
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(label)), ms)
+    ),
+  ]);
 }
 
 app.listen(PORT, () => console.log(`✅ ContentMølle backend on :${PORT}`));
