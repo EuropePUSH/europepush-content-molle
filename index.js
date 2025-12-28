@@ -39,23 +39,31 @@ app.use(express.json({ limit: "2mb" }));
 const UPLOADS_DIR = path.join(os.tmpdir(), "content-molle-uploads");
 await fs.mkdir(UPLOADS_DIR, { recursive: true });
 
-const allowedOrigins = ["https://europepush.com"];
+// ---- CORS (FIX)
+const allowedOrigins = new Set([
+  "https://europepush.com",
+  "https://www.europepush.com",
+]);
 const base44Regex = /^https:\/\/preview-sandbox--.*\.base44\.app$/;
 
 app.use(
   cors({
     origin: (origin, callback) => {
+      console.log("[CORS] origin:", origin);
+
       // Allow server-to-server & tools like curl/postman
       if (!origin) return callback(null, true);
 
-      if (allowedOrigins.includes(origin)) return callback(null, true);
+      if (allowedOrigins.has(origin)) return callback(null, true);
       if (base44Regex.test(origin)) return callback(null, true);
 
-      return callback(new Error("CORS not allowed"), false);
+      // Not allowed -> no CORS headers (browser will block)
+      return callback(null, false);
     },
     credentials: true,
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+    optionsSuccessStatus: 204,
   })
 );
 
@@ -103,7 +111,13 @@ const upload = multer({
 app.post("/molle", upload.array("videos", 20), async (req, res) => {
   try {
     if (!tryAcquireBatch()) {
-      return res.status(429).json({ ok: false, error: "busy", message: "Server is processing another batch. Try again in a moment." });
+      return res
+        .status(429)
+        .json({
+          ok: false,
+          error: "busy",
+          message: "Server is processing another batch. Try again in a moment.",
+        });
     }
     if (!supabase)
       return res
@@ -115,14 +129,14 @@ app.post("/molle", upload.array("videos", 20), async (req, res) => {
     // Defensive: ensure disk paths exist
     for (const f of files) {
       if (!f.path) {
-        return res.status(400).json({ ok: false, error: "upload_missing_path" });
+        return res
+          .status(400)
+          .json({ ok: false, error: "upload_missing_path" });
       }
     }
 
     if (!files.length)
-      return res
-        .status(400)
-        .json({ ok: false, error: "no_videos_uploaded" });
+      return res.status(400).json({ ok: false, error: "no_videos_uploaded" });
 
     // Settings from form-data
     const noCaptionMode = req.body.noCaptionMode === "true";
@@ -170,8 +184,12 @@ app.post("/molle", upload.array("videos", 20), async (req, res) => {
       });
 
       // Cleanup temp files to reduce disk usage
-      try { await fs.unlink(inputPath); } catch {}
-      try { await fs.unlink(outPath); } catch {}
+      try {
+        await fs.unlink(inputPath);
+      } catch {}
+      try {
+        await fs.unlink(outPath);
+      } catch {}
     }
 
     // CSV upload
@@ -209,7 +227,13 @@ app.post("/molle", upload.array("videos", 20), async (req, res) => {
 app.post("/molle-from-storage", async (req, res) => {
   try {
     if (!tryAcquireBatch()) {
-      return res.status(429).json({ ok: false, error: "busy", message: "Server is processing another batch. Try again in a moment." });
+      return res
+        .status(429)
+        .json({
+          ok: false,
+          error: "busy",
+          message: "Server is processing another batch. Try again in a moment.",
+        });
     }
     if (!supabase)
       return res
@@ -219,18 +243,15 @@ app.post("/molle-from-storage", async (req, res) => {
     const body = req.body || {};
     const paths = Array.isArray(body.paths) ? body.paths : [];
 
-    console.log(
-      "[/molle-from-storage] received paths:",
-      paths.length,
-      paths[0]
-    );
+    console.log("[/molle-from-storage] received paths:", paths.length, paths[0]);
 
     if (!paths.length)
       return res.status(400).json({ ok: false, error: "no_paths_provided" });
 
     const maxCount = Math.min(paths.length, 20);
 
-    const noCaptionMode = body.noCaptionMode === true || body.noCaptionMode === "true";
+    const noCaptionMode =
+      body.noCaptionMode === true || body.noCaptionMode === "true";
     const level = body.level || "1";
     const theme = (body.theme || "snus").trim();
 
@@ -250,7 +271,12 @@ app.post("/molle-from-storage", async (req, res) => {
     for (let i = 0; i < maxCount; i++) {
       const storagePath = String(paths[i] || "").trim();
       if (!storagePath) {
-        errors.push({ idx: i, input_path: storagePath, stage: "validate", message: "invalid_path" });
+        errors.push({
+          idx: i,
+          input_path: storagePath,
+          stage: "validate",
+          message: "invalid_path",
+        });
         continue;
       }
 
@@ -258,27 +284,52 @@ app.post("/molle-from-storage", async (req, res) => {
       const outPath = path.join(tmpDir, `out_${i}.mp4`);
 
       try {
-        console.log(`[molle-from-storage] (${i + 1}/${maxCount}) download start`, storagePath);
+        console.log(
+          `[molle-from-storage] (${i + 1}/${maxCount}) download start`,
+          storagePath
+        );
         await withTimeout(
           downloadFromSupabaseInputs(storagePath, inputPath),
           120000,
           "download_timeout"
         );
-        console.log(`[molle-from-storage] (${i + 1}/${maxCount}) download done`, inputPath);
+        console.log(
+          `[molle-from-storage] (${i + 1}/${maxCount}) download done`,
+          inputPath
+        );
 
-        console.log(`[molle-from-storage] (${i + 1}/${maxCount}) ffmpeg start`, inputPath);
-        await withTimeout(runFfmpegLevel1({ inputPath, outPath }), 180000, "ffmpeg_timeout");
-        console.log(`[molle-from-storage] (${i + 1}/${maxCount}) ffmpeg done`, outPath);
+        console.log(
+          `[molle-from-storage] (${i + 1}/${maxCount}) ffmpeg start`,
+          inputPath
+        );
+        await withTimeout(
+          runFfmpegLevel1({ inputPath, outPath }),
+          180000,
+          "ffmpeg_timeout"
+        );
+        console.log(
+          `[molle-from-storage] (${i + 1}/${maxCount}) ffmpeg done`,
+          outPath
+        );
 
-        console.log(`[molle-from-storage] (${i + 1}/${maxCount}) upload start`, outPath);
+        console.log(
+          `[molle-from-storage] (${i + 1}/${maxCount}) upload start`,
+          outPath
+        );
         const outBuf = await fs.readFile(outPath);
-        const objectPath = `batches/${batchId}/clip_${String(i + 1).padStart(2, "0")}.mp4`;
+        const objectPath = `batches/${batchId}/clip_${String(i + 1).padStart(
+          2,
+          "0"
+        )}.mp4`;
         const publicUrl = await withTimeout(
           uploadToSupabase(objectPath, outBuf, "video/mp4"),
           120000,
           "upload_timeout"
         );
-        console.log(`[molle-from-storage] (${i + 1}/${maxCount}) upload done`, publicUrl);
+        console.log(
+          `[molle-from-storage] (${i + 1}/${maxCount}) upload done`,
+          publicUrl
+        );
 
         const cap = captionsPack.items[i];
         results.push({
@@ -290,7 +341,11 @@ app.post("/molle-from-storage", async (req, res) => {
           hashtags: cap.hashtags,
         });
       } catch (e) {
-        console.error(`[molle-from-storage] (${i + 1}/${maxCount}) error`, storagePath, e);
+        console.error(
+          `[molle-from-storage] (${i + 1}/${maxCount}) error`,
+          storagePath,
+          e
+        );
         errors.push({
           idx: i,
           input_path: storagePath,
@@ -299,8 +354,12 @@ app.post("/molle-from-storage", async (req, res) => {
         });
       } finally {
         // Cleanup temp files
-        try { await fs.unlink(inputPath); } catch {}
-        try { await fs.unlink(outPath); } catch {}
+        try {
+          await fs.unlink(inputPath);
+        } catch {}
+        try {
+          await fs.unlink(outPath);
+        } catch {}
       }
     }
 
@@ -361,9 +420,7 @@ async function uploadToSupabase(objectPath, buffer, contentType) {
 
   if (error) throw error;
 
-  const { data } = supabase.storage
-    .from(SUPABASE_BUCKET)
-    .getPublicUrl(objectPath);
+  const { data } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(objectPath);
   return data.publicUrl;
 }
 
@@ -424,9 +481,7 @@ function runFfmpegLevel1({ inputPath, outPath }) {
 function withTimeout(promise, ms, label) {
   return Promise.race([
     promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(label)), ms)
-    ),
+    new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms)),
   ]);
 }
 
