@@ -11,6 +11,71 @@ function releaseBatch() {
   activeBatches = Math.max(0, activeBatches - 1);
 }
 
+// ---- In-memory job store + FIFO queue (keeps UI snappy; avoids long-running HTTP requests)
+const jobs = new Map();
+const jobQueue = [];
+
+function createJob({ batchId, payload }) {
+  const job = {
+    ok: true,
+    batchId,
+    status: "queued", // queued | processing | done | error
+    progress: 0,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    payload,
+    results: [],
+    errors: [],
+    csv_url: null,
+    zip_url: null,
+    level: payload.level || "1",
+    noCaptionMode: !!payload.noCaptionMode,
+    theme: payload.theme || "snus",
+    count: 0,
+  };
+  jobs.set(batchId, job);
+  return job;
+}
+
+function enqueueJob(batchId) {
+  jobQueue.push(batchId);
+  // kick worker loop
+  void processQueue();
+}
+
+let queueLoopRunning = false;
+async function processQueue() {
+  if (queueLoopRunning) return;
+  queueLoopRunning = true;
+
+  try {
+    while (jobQueue.length > 0) {
+      // respect MAX_CONCURRENT_BATCHES via existing limiter
+      if (!tryAcquireBatch()) break;
+
+      const batchId = jobQueue.shift();
+      const job = jobs.get(batchId);
+      if (!job) {
+        releaseBatch();
+        continue;
+      }
+
+      // run job without blocking the queue loop
+      void processOneJob(job)
+        .catch((e) => {
+          console.error("[queue] job crashed", batchId, e);
+        })
+        .finally(() => {
+          releaseBatch();
+          // kick again in case there are more jobs waiting
+          void processQueue();
+        });
+    }
+  } finally {
+    queueLoopRunning = false;
+  }
+}
+
 import multer from "multer";
 import cors from "cors";
 import os from "os";
@@ -222,19 +287,10 @@ app.post("/molle", upload.array("videos", 20), async (req, res) => {
   }
 });
 
-// ---- Alternative endpoint: process already-uploaded files from Supabase Storage (browser uploads directly)
+// ---- Alternative endpoint: enqueue processing of already-uploaded files from Supabase Storage (browser uploads directly)
 // Body: { paths: string[], noCaptionMode?: boolean|string, level?: string, theme?: string }
 app.post("/molle-from-storage", async (req, res) => {
   try {
-    if (!tryAcquireBatch()) {
-      return res
-        .status(429)
-        .json({
-          ok: false,
-          error: "busy",
-          message: "Server is processing another batch. Try again in a moment.",
-        });
-    }
     if (!supabase)
       return res
         .status(500)
@@ -256,141 +312,203 @@ app.post("/molle-from-storage", async (req, res) => {
     const theme = (body.theme || "snus").trim();
 
     const batchId = `batch_${nanoid(10)}`;
-    const tmpDir = path.join(os.tmpdir(), batchId);
-    await fs.mkdir(tmpDir, { recursive: true });
 
-    const captionsPack = makeBatchCaptions({
-      count: maxCount,
-      noCaptionMode,
-      theme,
+    createJob({
+      batchId,
+      payload: {
+        paths: paths.slice(0, maxCount),
+        noCaptionMode,
+        level,
+        theme,
+      },
     });
 
-    const results = [];
-    const errors = [];
+    enqueueJob(batchId);
 
-    for (let i = 0; i < maxCount; i++) {
-      const storagePath = String(paths[i] || "").trim();
-      if (!storagePath) {
-        errors.push({
-          idx: i,
-          input_path: storagePath,
-          stage: "validate",
-          message: "invalid_path",
-        });
-        continue;
-      }
-
-      const inputPath = path.join(tmpDir, `in_${i}.mp4`);
-      const outPath = path.join(tmpDir, `out_${i}.mp4`);
-
-      try {
-        console.log(
-          `[molle-from-storage] (${i + 1}/${maxCount}) download start`,
-          storagePath
-        );
-        await withTimeout(
-          downloadFromSupabaseInputs(storagePath, inputPath),
-          120000,
-          "download_timeout"
-        );
-        console.log(
-          `[molle-from-storage] (${i + 1}/${maxCount}) download done`,
-          inputPath
-        );
-
-        console.log(
-          `[molle-from-storage] (${i + 1}/${maxCount}) ffmpeg start`,
-          inputPath
-        );
-        await withTimeout(
-          runFfmpegLevel1({ inputPath, outPath }),
-          180000,
-          "ffmpeg_timeout"
-        );
-        console.log(
-          `[molle-from-storage] (${i + 1}/${maxCount}) ffmpeg done`,
-          outPath
-        );
-
-        console.log(
-          `[molle-from-storage] (${i + 1}/${maxCount}) upload start`,
-          outPath
-        );
-        const outBuf = await fs.readFile(outPath);
-        const objectPath = `batches/${batchId}/clip_${String(i + 1).padStart(
-          2,
-          "0"
-        )}.mp4`;
-        const publicUrl = await withTimeout(
-          uploadToSupabase(objectPath, outBuf, "video/mp4"),
-          120000,
-          "upload_timeout"
-        );
-        console.log(
-          `[molle-from-storage] (${i + 1}/${maxCount}) upload done`,
-          publicUrl
-        );
-
-        const cap = captionsPack.items[i];
-        results.push({
-          idx: i,
-          input_name: path.basename(storagePath),
-          input_path: storagePath,
-          output_url: publicUrl,
-          caption: cap.caption,
-          hashtags: cap.hashtags,
-        });
-      } catch (e) {
-        console.error(
-          `[molle-from-storage] (${i + 1}/${maxCount}) error`,
-          storagePath,
-          e
-        );
-        errors.push({
-          idx: i,
-          input_path: storagePath,
-          stage: String(e?.message || "error"),
-          message: String(e?.message || e),
-        });
-      } finally {
-        // Cleanup temp files
-        try {
-          await fs.unlink(inputPath);
-        } catch {}
-        try {
-          await fs.unlink(outPath);
-        } catch {}
-      }
-    }
-
-    const csv = toCsv(results);
-    const csvPath = `batches/${batchId}/captions.csv`;
-    const csvUrl = await uploadToSupabase(
-      csvPath,
-      Buffer.from(csv, "utf8"),
-      "text/csv"
-    );
-
-    return res.json({
+    // Return immediately (no long-running request)
+    return res.status(202).json({
       ok: true,
       batchId,
-      level,
-      noCaptionMode,
-      theme,
-      count: results.length,
-      csv_url: csvUrl,
-      zip_url: null,
-      results,
-      errors,
+      status: "queued",
+      message: "Batch queued for processing",
     });
   } catch (err) {
-    console.error("[/molle-from-storage] error:", err);
-    res
+    console.error("[/molle-from-storage] enqueue error:", err);
+    return res
       .status(500)
       .json({ ok: false, error: "internal_error", message: err.message });
-  } finally {
-    releaseBatch();
   }
+});
+
+// Job status polling endpoint
+app.get("/batch/:batchId", (req, res) => {
+  const { batchId } = req.params;
+  const job = jobs.get(batchId);
+  if (!job) return res.status(404).json({ ok: false, error: "not_found" });
+
+  // return without payload to avoid leaking internal details
+  const {
+    payload, // eslint-disable-line no-unused-vars
+    ...publicJob
+  } = job;
+
+  return res.json(publicJob);
+});
+
+async function processOneJob(job) {
+  job.status = "processing";
+  job.progress = 0;
+  job.updatedAt = Date.now();
+
+  const { paths } = job.payload;
+  const maxCount = Math.min(paths.length, 20);
+
+  const noCaptionMode = !!job.payload.noCaptionMode;
+  const level = job.payload.level || "1";
+  const theme = (job.payload.theme || "snus").trim();
+
+  const batchId = job.batchId;
+
+  const tmpDir = path.join(os.tmpdir(), batchId);
+  await fs.mkdir(tmpDir, { recursive: true });
+
+  const captionsPack = makeBatchCaptions({
+    count: maxCount,
+    noCaptionMode,
+    theme,
+  });
+
+  const results = [];
+  const errors = [];
+
+  for (let i = 0; i < maxCount; i++) {
+    const storagePath = String(paths[i] || "").trim();
+    if (!storagePath) {
+      errors.push({
+        idx: i,
+        input_path: storagePath,
+        stage: "validate",
+        message: "invalid_path",
+      });
+      job.progress = Math.round(((i + 1) / maxCount) * 100);
+      job.updatedAt = Date.now();
+      continue;
+    }
+
+    const inputPath = path.join(tmpDir, `in_${i}.mp4`);
+    const outPath = path.join(tmpDir, `out_${i}.mp4`);
+
+    try {
+      console.log(
+        `[molle-from-storage] (${i + 1}/${maxCount}) download start`,
+        storagePath
+      );
+      await withTimeout(
+        downloadFromSupabaseInputs(storagePath, inputPath),
+        120000,
+        "download_timeout"
+      );
+      console.log(
+        `[molle-from-storage] (${i + 1}/${maxCount}) download done`,
+        inputPath
+      );
+
+      console.log(
+        `[molle-from-storage] (${i + 1}/${maxCount}) ffmpeg start`,
+        inputPath
+      );
+      await withTimeout(
+        runFfmpegLevel1({ inputPath, outPath }),
+        240000,
+        "ffmpeg_timeout"
+      );
+      console.log(
+        `[molle-from-storage] (${i + 1}/${maxCount}) ffmpeg done`,
+        outPath
+      );
+
+      console.log(
+        `[molle-from-storage] (${i + 1}/${maxCount}) upload start`,
+        outPath
+      );
+
+      const objectPath = `batches/${batchId}/clip_${String(i + 1).padStart(
+        2,
+        "0"
+      )}.mp4`;
+
+      // Stream upload (avoids loading whole MP4 into RAM)
+      const publicUrl = await withTimeout(
+        uploadFileStreamToSupabase(objectPath, outPath, "video/mp4"),
+        180000,
+        "upload_timeout"
+      );
+
+      console.log(
+        `[molle-from-storage] (${i + 1}/${maxCount}) upload done`,
+        publicUrl
+      );
+
+      const cap = captionsPack.items[i];
+      results.push({
+        idx: i,
+        input_name: path.basename(storagePath),
+        input_path: storagePath,
+        output_url: publicUrl,
+        caption: cap.caption,
+        hashtags: cap.hashtags,
+      });
+    } catch (e) {
+      console.error(
+        `[molle-from-storage] (${i + 1}/${maxCount}) error`,
+        storagePath,
+        e
+      );
+      errors.push({
+        idx: i,
+        input_path: storagePath,
+        stage: String(e?.message || "error"),
+        message: String(e?.message || e),
+      });
+    } finally {
+      // Cleanup temp files
+      try {
+        await fs.unlink(inputPath);
+      } catch {}
+      try {
+        await fs.unlink(outPath);
+      } catch {}
+
+      job.progress = Math.round(((i + 1) / maxCount) * 100);
+      job.updatedAt = Date.now();
+    }
+  }
+
+  // CSV upload (small -> buffer is fine)
+  const csv = toCsv(results);
+  const csvPath = `batches/${batchId}/captions.csv`;
+  const csvUrl = await uploadToSupabase(
+    csvPath,
+    Buffer.from(csv, "utf8"),
+    "text/csv"
+  );
+
+  job.results = results;
+  job.errors = errors;
+  job.csv_url = csvUrl;
+  job.level = level;
+  job.noCaptionMode = noCaptionMode;
+  job.theme = theme;
+  job.count = results.length;
+  job.zip_url = null;
+  job.status = errors.length && results.length === 0 ? "error" : "done";
+  job.progress = 100;
+  job.updatedAt = Date.now();
+
+  // Cleanup temp dir (best effort)
+  try {
+    await fs.rmdir(tmpDir, { recursive: true });
+  } catch {}
 });
 
 async function downloadFromSupabaseInputs(objectPath, destPath) {
@@ -424,15 +542,44 @@ async function uploadToSupabase(objectPath, buffer, contentType) {
   return data.publicUrl;
 }
 
+// Stream upload to Supabase Storage (avoids RAM spikes from fs.readFile on big mp4s)
+async function uploadFileStreamToSupabase(objectPath, filePath, contentType) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error("supabase_not_configured");
+  }
+
+  // Supabase Storage upload endpoint
+  const url = `${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${objectPath}`;
+
+  const stream = fssync.createReadStream(filePath);
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "content-type": contentType,
+      "x-upsert": "true",
+    },
+    body: stream,
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    throw new Error(`supabase_stream_upload_failed status=${resp.status} ${txt}`);
+  }
+
+  const { data } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(objectPath);
+  return data.publicUrl;
+}
+
 function runFfmpegLevel1({ inputPath, outPath }) {
   const vf =
-    // keep tiktok format, then tiny changes (keep it light for speed)
-    "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=lanczos," +
+    // keep tiktok format, but use cheaper scaling (bilinear) to reduce CPU
+    "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=bilinear," +
     "pad=1080:1920:(1080-iw)/2:(1920-ih)/2," +
-    // micro crop -> pad back (fingerprint change)
-    "crop=1078:1918:1:1,pad=1080:1920:1:1," +
-    // tiny eq (avoid heavy noise for speed)
-    "eq=contrast=1.015:saturation=1.008:brightness=0.005";
+    // tiny eq for fingerprint change (lightweight)
+    "eq=contrast=1.012:saturation=1.006:brightness=0.004";
 
   const baseArgs = [
     "-y",
@@ -449,9 +596,11 @@ function runFfmpegLevel1({ inputPath, outPath }) {
     "-pix_fmt",
     "yuv420p",
     "-preset",
-    "veryfast",
+    "superfast",
     "-crf",
-    "22",
+    "23",
+    "-threads",
+    "2",
     "-movflags",
     "+faststart",
   ];
