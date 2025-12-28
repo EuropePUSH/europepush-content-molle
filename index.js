@@ -1,4 +1,16 @@
 import express from "express";
+// ---- simple in-memory concurrency limiter (prevents ffmpeg RAM/CPU spikes)
+const MAX_CONCURRENT_BATCHES = Number(process.env.MAX_CONCURRENT_BATCHES || 1);
+let activeBatches = 0;
+function tryAcquireBatch() {
+  if (activeBatches >= MAX_CONCURRENT_BATCHES) return false;
+  activeBatches += 1;
+  return true;
+}
+function releaseBatch() {
+  activeBatches = Math.max(0, activeBatches - 1);
+}
+
 import multer from "multer";
 import cors from "cors";
 import os from "os";
@@ -90,6 +102,9 @@ const upload = multer({
 // ---- Main endpoint: batch mode (1–20)
 app.post("/molle", upload.array("videos", 20), async (req, res) => {
   try {
+    if (!tryAcquireBatch()) {
+      return res.status(429).json({ ok: false, error: "busy", message: "Server is processing another batch. Try again in a moment." });
+    }
     if (!supabase)
       return res
         .status(500)
@@ -184,6 +199,8 @@ app.post("/molle", upload.array("videos", 20), async (req, res) => {
     res
       .status(500)
       .json({ ok: false, error: "internal_error", message: err.message });
+  } finally {
+    releaseBatch();
   }
 });
 
@@ -191,6 +208,9 @@ app.post("/molle", upload.array("videos", 20), async (req, res) => {
 // Body: { paths: string[], noCaptionMode?: boolean|string, level?: string, theme?: string }
 app.post("/molle-from-storage", async (req, res) => {
   try {
+    if (!tryAcquireBatch()) {
+      return res.status(429).json({ ok: false, error: "busy", message: "Server is processing another batch. Try again in a moment." });
+    }
     if (!supabase)
       return res
         .status(500)
@@ -225,43 +245,63 @@ app.post("/molle-from-storage", async (req, res) => {
     });
 
     const results = [];
+    const errors = [];
 
     for (let i = 0; i < maxCount; i++) {
       const storagePath = String(paths[i] || "").trim();
-      console.log(`[molle-from-storage] (${i + 1}/${maxCount}) start`, storagePath);
-      if (!storagePath)
-        return res.status(400).json({ ok: false, error: "invalid_path", idx: i });
+      if (!storagePath) {
+        errors.push({ idx: i, input_path: storagePath, stage: "validate", message: "invalid_path" });
+        continue;
+      }
 
       const inputPath = path.join(tmpDir, `in_${i}.mp4`);
       const outPath = path.join(tmpDir, `out_${i}.mp4`);
 
-      // Download from Supabase inputs bucket -> disk
-      await withTimeout(downloadFromSupabaseInputs(storagePath, inputPath), 120000, "download_timeout");
-      console.log(`[molle-from-storage] (${i + 1}/${maxCount}) downloaded ->`, inputPath);
+      try {
+        console.log(`[molle-from-storage] (${i + 1}/${maxCount}) download start`, storagePath);
+        await withTimeout(
+          downloadFromSupabaseInputs(storagePath, inputPath),
+          120000,
+          "download_timeout"
+        );
+        console.log(`[molle-from-storage] (${i + 1}/${maxCount}) download done`, inputPath);
 
-      // Process -> disk
-      await withTimeout(runFfmpegLevel1({ inputPath, outPath }), 180000, "ffmpeg_timeout");
-      console.log(`[molle-from-storage] (${i + 1}/${maxCount}) ffmpeg done ->`, outPath);
+        console.log(`[molle-from-storage] (${i + 1}/${maxCount}) ffmpeg start`, inputPath);
+        await withTimeout(runFfmpegLevel1({ inputPath, outPath }), 180000, "ffmpeg_timeout");
+        console.log(`[molle-from-storage] (${i + 1}/${maxCount}) ffmpeg done`, outPath);
 
-      // Upload output -> outputs bucket
-      const outBuf = await fs.readFile(outPath);
-      const objectPath = `batches/${batchId}/clip_${String(i + 1).padStart(2, "0")}.mp4`;
-      const publicUrl = await withTimeout(uploadToSupabase(objectPath, outBuf, "video/mp4"), 120000, "upload_timeout");
-      console.log(`[molle-from-storage] (${i + 1}/${maxCount}) uploaded ->`, publicUrl);
+        console.log(`[molle-from-storage] (${i + 1}/${maxCount}) upload start`, outPath);
+        const outBuf = await fs.readFile(outPath);
+        const objectPath = `batches/${batchId}/clip_${String(i + 1).padStart(2, "0")}.mp4`;
+        const publicUrl = await withTimeout(
+          uploadToSupabase(objectPath, outBuf, "video/mp4"),
+          120000,
+          "upload_timeout"
+        );
+        console.log(`[molle-from-storage] (${i + 1}/${maxCount}) upload done`, publicUrl);
 
-      const cap = captionsPack.items[i];
-      results.push({
-        idx: i,
-        input_name: path.basename(storagePath),
-        input_path: storagePath,
-        output_url: publicUrl,
-        caption: cap.caption,
-        hashtags: cap.hashtags,
-      });
-
-      // Cleanup temp files
-      try { await fs.unlink(inputPath); } catch {}
-      try { await fs.unlink(outPath); } catch {}
+        const cap = captionsPack.items[i];
+        results.push({
+          idx: i,
+          input_name: path.basename(storagePath),
+          input_path: storagePath,
+          output_url: publicUrl,
+          caption: cap.caption,
+          hashtags: cap.hashtags,
+        });
+      } catch (e) {
+        console.error(`[molle-from-storage] (${i + 1}/${maxCount}) error`, storagePath, e);
+        errors.push({
+          idx: i,
+          input_path: storagePath,
+          stage: String(e?.message || "error"),
+          message: String(e?.message || e),
+        });
+      } finally {
+        // Cleanup temp files
+        try { await fs.unlink(inputPath); } catch {}
+        try { await fs.unlink(outPath); } catch {}
+      }
     }
 
     const csv = toCsv(results);
@@ -282,12 +322,15 @@ app.post("/molle-from-storage", async (req, res) => {
       csv_url: csvUrl,
       zip_url: null,
       results,
+      errors,
     });
   } catch (err) {
     console.error("[/molle-from-storage] error:", err);
     res
       .status(500)
       .json({ ok: false, error: "internal_error", message: err.message });
+  } finally {
+    releaseBatch();
   }
 });
 
@@ -325,51 +368,57 @@ async function uploadToSupabase(objectPath, buffer, contentType) {
 }
 
 function runFfmpegLevel1({ inputPath, outPath }) {
-  return new Promise((resolve, reject) => {
-    const vf =
-      "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=lanczos," +
-      "pad=1080:1920:(1080-iw)/2:(1920-ih)/2," +
-      "crop=1078:1918:1:1,pad=1080:1920:1:1," +
-      "noise=alls=6:allf=t,eq=contrast=1.02:saturation=1.01:brightness=0.01";
+  const vf =
+    // keep tiktok format, then tiny changes (keep it light for speed)
+    "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=lanczos," +
+    "pad=1080:1920:(1080-iw)/2:(1920-ih)/2," +
+    // micro crop -> pad back (fingerprint change)
+    "crop=1078:1918:1:1,pad=1080:1920:1:1," +
+    // tiny eq (avoid heavy noise for speed)
+    "eq=contrast=1.015:saturation=1.008:brightness=0.005";
 
-    const args = [
-      "-y",
-      "-hide_banner",
-      "-nostdin",
-      "-i",
-      inputPath,
-      "-vf",
-      vf,
-      "-c:v",
-      "libx264",
-      "-profile:v",
-      "high",
-      "-pix_fmt",
-      "yuv420p",
-      "-preset",
-      "medium",
-      "-crf",
-      "19",
-      "-c:a",
-      "copy",
-      "-movflags",
-      "+faststart",
-      outPath,
-    ];
+  const baseArgs = [
+    "-y",
+    "-hide_banner",
+    "-nostdin",
+    "-i",
+    inputPath,
+    "-vf",
+    vf,
+    "-c:v",
+    "libx264",
+    "-profile:v",
+    "high",
+    "-pix_fmt",
+    "yuv420p",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "22",
+    "-movflags",
+    "+faststart",
+  ];
 
-    const ff = spawn(ffmpegPath, args);
-
-    let stderr = "";
-    ff.stderr.on("data", (d) => {
-      stderr += d.toString();
+  function spawnFfmpeg(args) {
+    return new Promise((resolve, reject) => {
+      const ff = spawn(ffmpegPath, args);
+      let stderr = "";
+      ff.stderr.on("data", (d) => {
+        stderr += d.toString();
+      });
+      ff.on("error", reject);
+      ff.on("close", (code) => {
+        if (code === 0) return resolve();
+        reject(new Error(`ffmpeg_failed code=${code}\n${stderr.slice(-3000)}`));
+      });
     });
+  }
 
-    ff.on("error", reject);
-    ff.on("close", (code) => {
-      if (code === 0) return resolve();
-      reject(new Error(`ffmpeg_failed code=${code}\n${stderr.slice(-3000)}`));
-    });
-  });
+  // Try to copy audio (fast). If it fails (weird inputs), fallback to AAC.
+  const tryCopyAudio = [...baseArgs, "-c:a", "copy", outPath];
+  const fallbackAac = [...baseArgs, "-c:a", "aac", "-b:a", "128k", outPath];
+
+  return spawnFfmpeg(tryCopyAudio).catch(() => spawnFfmpeg(fallbackAac));
 }
 
 function withTimeout(promise, ms, label) {
