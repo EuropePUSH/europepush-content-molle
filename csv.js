@@ -7,12 +7,10 @@ function escapeCsv(v) {
 }
 
 export function toCsv(results) {
-  const header = ["idx", "input_name", "output_url", "caption", "hashtags"].join(",");
+  const header = ["video", "caption", "hashtags"].join(",");
   const rows = results.map(r => {
     const hashtags = (r.hashtags || []).join(" ");
     return [
-      r.idx,
-      escapeCsv(r.input_name),
       escapeCsv(r.output_url),
       escapeCsv(r.caption),
       escapeCsv(hashtags)
