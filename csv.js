@@ -7,54 +7,40 @@ function escapeCsv(value) {
 }
 
 /**
- * Generates a Metricool CALENDAR-compatible CSV.
- * One row = one TikTok post.
- * Scheduling (4/day etc.) is handled inside Metricool, not here.
+ * Metricool AUTOLIST CSV
+ * EXACTLY TWO COLUMNS:
+ *  1. Text
+ *  2. Picture Url 1 (direct public mp4 link)
  */
 export function toCsv(results = []) {
-  const header = [
-    "Text",
-    "Date",
-    "Time",
-    "Draft",
-    "Facebook",
-    "Twitter",
-    "LinkedIn",
-    "GBP",
-    "Instagram",
-    "Pinterest",
-    "TikTok",
-    "YouTube",
-    "Threads",
-    "Picture Url 1",
-    "TikTok Post Privacy"
-  ].join(",");
+  const header = ["Text", "Picture Url 1"].join(",");
 
-  const rows = results.map((r) => {
-    const caption = r.caption || "";
-    const hashtags = Array.isArray(r.hashtags) ? r.hashtags.join(" ") : "";
-    const text = [caption, hashtags].filter(Boolean).join("\n\n");
+  const rows = results
+    .filter(r => r && (r.output_url || r.videoUrl || r.video_url))
+    .map((r) => {
+      const caption = (r.caption || "").trim();
 
-    const videoUrl = r.output_url || r.videoUrl || "";
+      const hashtags = Array.isArray(r.hashtags)
+        ? r.hashtags
+            .map(h => String(h).trim())
+            .filter(Boolean)
+            .join(" ")
+        : "";
 
-    return [
-      escapeCsv(text),
-      "",                 // Date (empty = Metricool decides)
-      "",                 // Time
-      "FALSE",            // Draft
-      "FALSE",            // Facebook
-      "FALSE",            // Twitter
-      "FALSE",            // LinkedIn
-      "FALSE",            // GBP
-      "FALSE",            // Instagram
-      "FALSE",            // Pinterest
-      "TRUE",             // TikTok
-      "FALSE",            // YouTube
-      "FALSE",            // Threads
-      escapeCsv(videoUrl),
-      "PUBLIC_TO_EVERYONE"
-    ].join(",");
-  });
+      // Metricool expects ONE text field
+      const text =
+        caption && hashtags
+          ? `${caption}\n\n${hashtags}`
+          : caption || hashtags || "";
+
+      const videoUrl =
+        r.output_url || r.videoUrl || r.video_url || "";
+
+      return [
+        escapeCsv(text),
+        escapeCsv(videoUrl)
+      ].join(",");
+    });
 
   return [header, ...rows].join("\n");
 }
