@@ -166,14 +166,14 @@ const upload = multer({
     },
   }),
   limits: {
-    files: 20,
+    files: 300,
     // keep a per-file cap as a safety net; adjust later if needed
     fileSize: 200 * 1024 * 1024,
   },
 });
 
-// ---- Main endpoint: batch mode (1–20)
-app.post("/molle", upload.array("videos", 20), async (req, res) => {
+// ---- Main endpoint: batch mode (1–300)
+app.post("/molle", upload.array("videos", 300), async (req, res) => {
   try {
     if (!tryAcquireBatch()) {
       return res
@@ -207,7 +207,7 @@ app.post("/molle", upload.array("videos", 20), async (req, res) => {
     const noCaptionMode = req.body.noCaptionMode === "true";
     const level = req.body.level || "1"; // only 1 supported right now
     const theme = (req.body.theme || "snus").trim();
-    const maxCount = Math.min(files.length, 20);
+    const maxCount = Math.min(files.length, 300);
 
     const batchId = `batch_${nanoid(10)}`;
     const tmpDir = path.join(os.tmpdir(), batchId);
@@ -289,16 +289,9 @@ app.post("/molle", upload.array("videos", 20), async (req, res) => {
 
 // ---- Alternative endpoint: process already-uploaded files from Supabase Storage (browser uploads directly)
 // Body: { paths: string[], noCaptionMode?: boolean|string, level?: string, theme?: string }
+// Returns immediately with a batchId; client polls GET /batch/:batchId
 app.post("/molle-from-storage", async (req, res) => {
   try {
-    if (!tryAcquireBatch()) {
-      return res.status(429).json({
-        ok: false,
-        error: "busy",
-        message: "Server is processing another batch. Try again in a moment.",
-      });
-    }
-
     if (!supabase)
       return res
         .status(500)
@@ -307,12 +300,17 @@ app.post("/molle-from-storage", async (req, res) => {
     const body = req.body || {};
     const paths = Array.isArray(body.paths) ? body.paths : [];
 
-    console.log("[/molle-from-storage] received paths:", paths.length, paths[0]);
+    console.log(
+      "[/molle-from-storage] received paths:",
+      paths.length,
+      "first:",
+      paths[0],
+      "MAX_FILES:",
+      Number(process.env.MAX_FILES || 0)
+    );
 
     if (!paths.length)
       return res.status(400).json({ ok: false, error: "no_paths_provided" });
-
-    const maxCount = Math.min(paths.length, 20);
 
     const noCaptionMode =
       body.noCaptionMode === true || body.noCaptionMode === "true";
@@ -324,36 +322,34 @@ app.post("/molle-from-storage", async (req, res) => {
     const job = createJob({
       batchId,
       payload: {
-        paths: paths.slice(0, maxCount),
+        // IMPORTANT: do NOT cap here; allow unlimited. If you want a safety cap,
+        // set MAX_FILES env and slice in processOneJob.
+        paths,
         noCaptionMode,
         level,
         theme,
       },
     });
 
-    // Run synchronously (frontend expects completed payload; no polling)
-    await processOneJob(job);
+    // Enqueue and return immediately (prevents Render HTTP timeouts)
+    enqueueJob(batchId);
 
-    return res.json({
+    return res.status(202).json({
       ok: true,
       batchId: job.batchId,
+      status: job.status,
+      queued: true,
       level: job.level,
       noCaptionMode: job.noCaptionMode,
       theme: job.theme,
-      count: job.count,
-      csv_url: job.csv_url,
-      zip_url: job.zip_url,
-      results: job.results,
-      errors: job.errors,
-      status: job.status,
+      count: 0,
+      message: "queued",
     });
   } catch (err) {
     console.error("[/molle-from-storage] error:", err);
     return res
       .status(500)
       .json({ ok: false, error: "internal_error", message: err.message });
-  } finally {
-    releaseBatch();
   }
 });
 
@@ -378,7 +374,22 @@ async function processOneJob(job) {
   job.updatedAt = Date.now();
 
   const { paths } = job.payload;
-  const maxCount = Math.min(paths.length, 20);
+
+  // Optional safety cap (0 = unlimited). If you ever see (x/20) again, it's because
+  // MAX_FILES is set to 20 in Render envs.
+  const MAX_FILES = Number(process.env.MAX_FILES || 0);
+
+  const workPaths =
+    MAX_FILES > 0 && paths.length > MAX_FILES ? paths.slice(0, MAX_FILES) : paths;
+
+  const maxCount = workPaths.length;
+
+  if (MAX_FILES > 0 && paths.length > MAX_FILES) {
+    console.warn(
+      `[molle-from-storage] TRUNCATED: received ${paths.length} paths, processing only ${MAX_FILES}. ` +
+        `Unset MAX_FILES (or set to 0) to run unlimited.`
+    );
+  }
 
   const noCaptionMode = !!job.payload.noCaptionMode;
   const level = job.payload.level || "1";
@@ -399,7 +410,7 @@ async function processOneJob(job) {
   const errors = [];
 
   for (let i = 0; i < maxCount; i++) {
-    const storagePath = String(paths[i] || "").trim();
+    const storagePath = String(workPaths[i] || "").trim();
     if (!storagePath) {
       errors.push({
         idx: i,
@@ -656,4 +667,4 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
-app.listen(PORT, () => console.log(`✅ ContentMølle backend on :${PORT}`));
+app.listen(PORT, () => console.log(`✅ ContentMølle backend on :${PORT}`)); 
