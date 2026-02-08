@@ -29,7 +29,28 @@ const CAPTIONS = [
   "One of those “don’t ask” habits.",
   "Soft launch of bad influence.",
   "Crisp taste, chaotic plans.",
-  "If you know, you *know*."
+  "If you know, you *know*.",
+  // EXPANDED pool (40+ total to reduce repetition over months)
+  "That fresh feeling hits different at 2am",
+  "When the mint is stronger than your self control",
+  "Main character energy in a small tin",
+  "Cool down, level up",
+  "Zero effort maximum vibe shift",
+  "The upgrade nobody asked about but everyone noticed",
+  "Underrated but never underestimated",
+  "Ice cold mentality starts here",
+  "Just a little something to switch the mood",
+  "That crisp focus when you need it most",
+  "Subtle chaos in your pocket",
+  "The vibe check nobody saw coming",
+  "When minty fresh becomes a lifestyle",
+  "This one hits at the right time every time",
+  "Energy shift loading",
+  "Small moves big changes",
+  "The comeback starts with the comeback flavor",
+  "Quiet confidence loud results",
+  "Chill mode activated",
+  "That one thing that just makes sense"
 ];
 
 const HASHTAGS = [
@@ -38,7 +59,14 @@ const HASHTAGS = [
   "#iceberg", "#maggie", "#pablo",
   "#mint", "#ice", "#chillvibes", "#nightdrive", "#dailyvibes",
   "#focusmode", "#energycheck", "#lowkey", "#aesthetic", "#cleanedit",
-  "#pouch", "#nic", "#prilla", "#icy"
+  "#pouch", "#nic", "#prilla", "#icy",
+  // EXPANDED pool (50+ total to avoid repetition)
+  "#vibes", "#mood", "#energy", "#fresh", "#crisp",
+  "#coldvibes", "#frosty", "#chill", "#relax", "#focus",
+  "#nightlife", "#latenight", "#midnightvibes", "#afterhours",
+  "#minimal", "#clean", "#smooth", "#pure", "#simple",
+  "#upgrade", "#levelup", "#nextlevel", "#newera", "#switch",
+  "#dailyroutine", "#habit", "#lifestyle", "#vibe", "#shift"
 ];
 
 export function makeBatchCaptions({ count, noCaptionMode, theme }) {
@@ -56,13 +84,24 @@ export function makeBatchCaptions({ count, noCaptionMode, theme }) {
   const caps = shuffle(CAPTIONS);
   const tags = shuffle(HASHTAGS);
 
+  // ANTI-SHADOWBAN: Vary caption presentation styles
+  const captionStyles = [
+    (c) => c,                           // Original
+    (c) => c.toLowerCase(),             // all lowercase
+    (c) => `${c} 👀`,                   // Add emoji
+    (c) => c.replace(/\./g, ''),        // Remove periods
+    (c) => `${c.split('.')[0]}...`,     // Ellipsis
+  ];
+
   const items = [];
   for (let i = 0; i < count; i++) {
-    const caption = caps[i % caps.length];
+    const rawCaption = caps[i % caps.length];
+    const style = captionStyles[i % captionStyles.length];
+    const caption = style(rawCaption);
 
-    // 6–9 hashtags, no repeats inside the same item
+    // ANTI-SHADOWBAN: Vary hashtag count per clip (6-10)
+    const needed = 6 + Math.floor(Math.random() * 5); // 6–10 hashtags
     const itemTags = [];
-    const needed = 8;
 
     // rotate the pool so we don’t repeat patterns too much
     const start = (i * 3) % tags.length;
@@ -73,7 +112,10 @@ export function makeBatchCaptions({ count, noCaptionMode, theme }) {
       if (itemTags.length >= needed) break;
     }
 
-    items.push({ caption, hashtags: itemTags });
+    // ANTI-SHADOWBAN: Shuffle hashtag order per video
+    const shuffledTags = shuffle(itemTags);
+
+    items.push({ caption, hashtags: shuffledTags });
   }
 
   return { id: `caps_${nanoid(6)}`, items };

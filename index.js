@@ -1,4 +1,21 @@
+import "dotenv/config";
 import express from "express";
+import multer from "multer";
+import cors from "cors";
+import os from "os";
+import path from "path";
+import fs from "fs/promises";
+import fssync from "fs";
+import { pipeline } from "stream/promises";
+import { createWriteStream } from "fs";
+import { spawn } from "child_process";
+import ffmpegPath from "ffmpeg-static";
+import { nanoid } from "nanoid";
+import { createClient } from "@supabase/supabase-js";
+
+import { makeBatchCaptions } from "./captions.js";
+import { toCsv } from "./csv.js";
+
 // ---- simple in-memory concurrency limiter (prevents ffmpeg RAM/CPU spikes)
 const MAX_CONCURRENT_BATCHES = Number(process.env.MAX_CONCURRENT_BATCHES || 1);
 let activeBatches = 0;
@@ -76,22 +93,6 @@ async function processQueue() {
   }
 }
 
-import multer from "multer";
-import cors from "cors";
-import os from "os";
-import path from "path";
-import fs from "fs/promises";
-import fssync from "fs";
-import { pipeline } from "stream/promises";
-import { createWriteStream } from "fs";
-import { spawn } from "child_process";
-import ffmpegPath from "ffmpeg-static";
-import { nanoid } from "nanoid";
-import { createClient } from "@supabase/supabase-js";
-
-import { makeBatchCaptions } from "./captions.js";
-import { toCsv } from "./csv.js";
-
 const app = express();
 
 app.use((req, res, next) => {
@@ -137,6 +138,17 @@ app.options("*", cors());
 
 const PORT = process.env.PORT || 10000;
 
+// DEBUG: Check what we're actually reading
+console.log('[DEBUG] Environment variables:');
+console.log('  TEST_MODE =', process.env.TEST_MODE);
+console.log('  SUPABASE_URL =', process.env.SUPABASE_URL ? 'SET' : 'NOT SET');
+console.log('  SUPABASE_SERVICE_ROLE_KEY =', process.env.SUPABASE_SERVICE_ROLE_KEY ? 'SET' : 'NOT SET');
+
+// TEST MODE: Set to 'true' to skip Supabase uploads (saves files locally instead)
+const TEST_MODE = process.env.TEST_MODE === 'true';
+
+console.log('[DEBUG] TEST_MODE parsed as:', TEST_MODE);
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "outputs";
@@ -144,12 +156,19 @@ const SUPABASE_INPUT_BUCKET = process.env.SUPABASE_INPUT_BUCKET || "inputs";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.warn("[WARN] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  if (!TEST_MODE) {
+    console.warn("[WARN] Set TEST_MODE=true to test locally without Supabase");
+  }
 }
 
 const supabase =
   SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
     ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     : null;
+
+if (TEST_MODE) {
+  console.log("[TEST MODE] 🧪 Running in test mode - files will be saved locally instead of Supabase");
+}
 
 // Health
 app.get("/", (req, res) => res.json({ ok: true, service: "content-molle" }));
@@ -184,7 +203,7 @@ app.post("/molle", upload.array("videos", 300), async (req, res) => {
           message: "Server is processing another batch. Try again in a moment.",
         });
     }
-    if (!supabase)
+    if (!supabase && !TEST_MODE)
       return res
         .status(500)
         .json({ ok: false, error: "supabase_not_configured" });
@@ -208,63 +227,86 @@ app.post("/molle", upload.array("videos", 300), async (req, res) => {
     const level = req.body.level || "1"; // only 1 supported right now
     const theme = (req.body.theme || "snus").trim();
     const maxCount = Math.min(files.length, 300);
+    
+    // ANTI-SHADOWBAN: Number of CSV files to generate (one per account)
+    const numCsvs = Math.min(parseInt(req.body.numCsvs) || 1, 50); // Max 50 CSVs
 
     const batchId = `batch_${nanoid(10)}`;
     const tmpDir = path.join(os.tmpdir(), batchId);
     await fs.mkdir(tmpDir, { recursive: true });
 
+    // ANTI-SHADOWBAN: Generate enough captions for all versions (numCsvs × videos)
+    const totalVideos = maxCount * numCsvs;
     const captionsPack = makeBatchCaptions({
-      count: maxCount,
+      count: totalVideos,
       noCaptionMode,
       theme,
     });
 
     const results = [];
 
-    for (let i = 0; i < maxCount; i++) {
-      const f = files[i];
-      // multer diskStorage provides a file path on disk
-      const inputPath = f.path;
-      const outPath = path.join(tmpDir, `out_${i}.mp4`);
+    // ANTI-SHADOWBAN: Process each video numCsvs times (creates unique versions per account)
+    for (let csvIndex = 0; csvIndex < numCsvs; csvIndex++) {
+      for (let i = 0; i < maxCount; i++) {
+        const f = files[i];
+        const inputPath = f.path;
+        const globalIdx = csvIndex * maxCount + i; // Unique index across all versions
+        const outPath = path.join(tmpDir, `out_csv${csvIndex}_clip${i}.mp4`);
 
-      // Level-1: tiny visual fingerprint changes, audio copied
-      await runFfmpegLevel1({ inputPath, outPath });
+        // Each version gets different randomization due to unique clipIndex
+        await runFfmpegLevel1({ inputPath, outPath, clipIndex: globalIdx });
 
-      const outBuf = await fs.readFile(outPath);
+        const outBuf = await fs.readFile(outPath);
 
-      // Upload mp4 to Supabase Storage
-      const objectPath = `batches/${batchId}/clip_${String(i + 1).padStart(
-        2,
-        "0"
-      )}.mp4`;
-      const publicUrl = await uploadToSupabase(objectPath, outBuf, "video/mp4");
+        // Upload mp4 to Supabase Storage
+        const objectPath = `batches/${batchId}/account_${String(csvIndex + 1).padStart(2, '0')}_clip_${String(i + 1).padStart(2, "0")}.mp4`;
+        const publicUrl = await uploadToSupabase(objectPath, outBuf, "video/mp4");
 
-      const cap = captionsPack.items[i]; // { caption, hashtags[] }
-      results.push({
-        idx: i,
-        input_name: f.originalname,
-        output_url: publicUrl,
-        caption: cap.caption,
-        hashtags: cap.hashtags,
-      });
+        // ANTI-SHADOWBAN: Each video gets unique caption from shuffled pool
+        const cap = captionsPack.items[globalIdx];
+        results.push({
+          csvIndex,
+          idx: i,
+          input_name: f.originalname,
+          output_url: publicUrl,
+          caption: cap.caption,
+          hashtags: cap.hashtags,
+        });
 
-      // Cleanup temp files to reduce disk usage
+        // Cleanup temp file
+        try {
+          await fs.unlink(outPath);
+        } catch {}
+      }
+    }
+
+    // Cleanup input files after all versions processed
+    for (const f of files) {
       try {
-        await fs.unlink(inputPath);
-      } catch {}
-      try {
-        await fs.unlink(outPath);
+        await fs.unlink(f.path);
       } catch {}
     }
 
-    // CSV upload
-    const csv = toCsv(results);
-    const csvPath = `batches/${batchId}/captions.csv`;
-    const csvUrl = await uploadToSupabase(
-      csvPath,
-      Buffer.from(csv, "utf8"),
-      "text/csv"
-    );
+    // ANTI-SHADOWBAN: Generate multiple CSV files (one per account with their unique videos)
+    const csvUrls = [];
+    
+    for (let csvIndex = 0; csvIndex < numCsvs; csvIndex++) {
+      // Filter results for this CSV (only videos processed for this account)
+      const csvResults = results.filter(r => r.csvIndex === csvIndex);
+      
+      const csv = toCsv(csvResults, { shuffleOrder: true });
+      const csvPath = `batches/${batchId}/captions_account_${String(csvIndex + 1).padStart(2, '0')}.csv`;
+      const csvUrl = await uploadToSupabase(
+        csvPath,
+        Buffer.from(csv, "utf8"),
+        "text/csv"
+      );
+      csvUrls.push({
+        account: csvIndex + 1,
+        url: csvUrl,
+        video_count: csvResults.length
+      });
+    }
 
     return res.json({
       ok: true,
@@ -273,7 +315,10 @@ app.post("/molle", upload.array("videos", 300), async (req, res) => {
       noCaptionMode,
       theme,
       count: results.length,
-      csv_url: csvUrl,
+      videos_per_account: maxCount,
+      num_csvs: numCsvs,
+      csv_urls: csvUrls, // Array of CSV URLs (one per account)
+      csv_url: csvUrls[0]?.url || null, // Backward compatibility
       zip_url: null,
       results,
     });
@@ -292,7 +337,7 @@ app.post("/molle", upload.array("videos", 300), async (req, res) => {
 // Returns immediately with a batchId; client polls GET /batch/:batchId
 app.post("/molle-from-storage", async (req, res) => {
   try {
-    if (!supabase)
+    if (!supabase && !TEST_MODE)
       return res
         .status(500)
         .json({ ok: false, error: "supabase_not_configured" });
@@ -316,6 +361,7 @@ app.post("/molle-from-storage", async (req, res) => {
       body.noCaptionMode === true || body.noCaptionMode === "true";
     const level = body.level || "1";
     const theme = (body.theme || "snus").trim();
+    const numCsvs = Math.min(parseInt(body.numCsvs) || 1, 50); // Max 50 CSVs
 
     const batchId = `batch_${nanoid(10)}`;
 
@@ -328,6 +374,7 @@ app.post("/molle-from-storage", async (req, res) => {
         noCaptionMode,
         level,
         theme,
+        numCsvs,
       },
     });
 
@@ -446,7 +493,7 @@ async function processOneJob(job) {
         inputPath
       );
       await withTimeout(
-        runFfmpegLevel1({ inputPath, outPath }),
+        runFfmpegLevel1({ inputPath, outPath, clipIndex: i }),
         240000,
         "ffmpeg_timeout"
       );
@@ -512,22 +559,33 @@ async function processOneJob(job) {
     }
   }
 
-  // CSV upload (small -> buffer is fine)
-  const csv = toCsv(results);
-  const csvPath = `batches/${batchId}/captions.csv`;
-  const csvUrl = await uploadToSupabase(
-    csvPath,
-    Buffer.from(csv, "utf8"),
-    "text/csv"
-  );
+  // ANTI-SHADOWBAN: Generate multiple CSV files (one per account with different shuffle)
+  const numCsvs = job.payload.numCsvs || 1;
+  const csvUrls = [];
+  
+  for (let csvIndex = 0; csvIndex < numCsvs; csvIndex++) {
+    const csv = toCsv(results, { shuffleOrder: true });
+    const csvPath = `batches/${batchId}/captions_account_${String(csvIndex + 1).padStart(2, '0')}.csv`;
+    const csvUrl = await uploadToSupabase(
+      csvPath,
+      Buffer.from(csv, "utf8"),
+      "text/csv"
+    );
+    csvUrls.push({
+      account: csvIndex + 1,
+      url: csvUrl
+    });
+  }
 
   job.results = results;
   job.errors = errors;
-  job.csv_url = csvUrl;
+  job.csv_urls = csvUrls;
+  job.csv_url = csvUrls[0]?.url || null; // Backward compatibility
   job.level = level;
   job.noCaptionMode = noCaptionMode;
   job.theme = theme;
   job.count = results.length;
+  job.num_csvs = numCsvs;
   job.zip_url = null;
   job.status = errors.length && results.length === 0 ? "error" : "done";
   job.progress = 100;
@@ -560,6 +618,19 @@ async function downloadFromSupabaseInputs(objectPath, destPath) {
 }
 
 async function uploadToSupabase(objectPath, buffer, contentType) {
+  // TEST MODE: Save locally instead of uploading to Supabase
+  if (TEST_MODE) {
+    const localDir = path.join(os.tmpdir(), 'content-molle-test-output');
+    await fs.mkdir(localDir, { recursive: true });
+    
+    const localPath = path.join(localDir, objectPath.replace(/\//g, '_'));
+    await fs.writeFile(localPath, buffer);
+    
+    const mockUrl = `file:///${localPath}`;
+    console.log(`[TEST MODE] Saved to: ${localPath}`);
+    return mockUrl;
+  }
+
   const { error } = await supabase.storage
     .from(SUPABASE_BUCKET)
     .upload(objectPath, buffer, { contentType, upsert: true });
@@ -572,6 +643,19 @@ async function uploadToSupabase(objectPath, buffer, contentType) {
 
 // Stream upload to Supabase Storage (avoids RAM spikes from fs.readFile on big mp4s)
 async function uploadFileStreamToSupabase(objectPath, filePath, contentType) {
+  // TEST MODE: Just copy file locally
+  if (TEST_MODE) {
+    const localDir = path.join(os.tmpdir(), 'content-molle-test-output');
+    await fs.mkdir(localDir, { recursive: true });
+    
+    const localPath = path.join(localDir, objectPath.replace(/\//g, '_'));
+    await fs.copyFile(filePath, localPath);
+    
+    const mockUrl = `file:///${localPath}`;
+    console.log(`[TEST MODE] Saved to: ${localPath}`);
+    return mockUrl;
+  }
+
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error("supabase_not_configured");
   }
@@ -606,13 +690,64 @@ async function uploadFileStreamToSupabase(objectPath, filePath, contentType) {
   return data.publicUrl;
 }
 
-function runFfmpegLevel1({ inputPath, outPath }) {
+function runFfmpegLevel1({ inputPath, outPath, clipIndex = 0 }) {
+  // ANTI-SHADOWBAN: Randomize visual fingerprint per video
+  const seed = clipIndex * 1337 + Date.now();
+  const rng = () => {
+    const x = Math.sin(seed + clipIndex * Math.random()) * 10000;
+    return x - Math.floor(x);
+  };
+
+  // Vary color grading by ±0.5% (invisible to humans, unique hash per clip)
+  const contrast = (1.012 + (rng() - 0.5) * 0.012).toFixed(4);   // 1.006–1.018
+  const saturation = (1.006 + (rng() - 0.5) * 0.010).toFixed(4); // 1.001–1.011
+  const brightness = (0.004 + (rng() - 0.5) * 0.008).toFixed(4); // 0.000–0.008
+
+  // ANTI-SHADOWBAN: Add imperceptible noise to vary hash (instead of trim which is complex)
+  const noiseStrength = (0.001 + rng() * 0.002).toFixed(4); // 0.001-0.003 (barely visible)
+
+  // ANTI-SHADOWBAN: Vary duration by adding black frames (imperceptible delay)
+  const startPadMs = Math.floor(rng() * 100); // 0-100ms black at start
+  const endPadMs = Math.floor(rng() * 150);   // 0-150ms black at end
+  const startPadSec = (startPadMs / 1000).toFixed(3);
+  const endPadSec = (endPadMs / 1000).toFixed(3);
+
   const vf =
     // keep tiktok format, but use cheaper scaling (bilinear) to reduce CPU
     "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=bilinear," +
     "pad=1080:1920:(1080-iw)/2:(1920-ih)/2," +
-    // tiny eq for fingerprint change (lightweight)
-    "eq=contrast=1.012:saturation=1.006:brightness=0.004";
+    // randomized eq for unique fingerprint per clip
+    `eq=contrast=${contrast}:saturation=${saturation}:brightness=${brightness},` +
+    // subtle noise for additional uniqueness
+    `noise=alls=${noiseStrength}:allf=t,` +
+    // duration variation via black padding (start + end)
+    `tpad=start_duration=${startPadSec}:stop_duration=${endPadSec}:color=black`;
+
+  // ANTI-SHADOWBAN: Randomize encoding params
+  const crf = 23 + Math.floor(rng() * 3); // 23–25
+  const preset = ['superfast', 'veryfast', 'faster'][Math.floor(rng() * 3)];
+
+  // ANTI-SHADOWBAN: Add imperceptible audio variation (prevents audio fingerprinting)
+  const audioFilters = [];
+  
+  // Vary volume by ±1% (imperceptible but changes waveform hash)
+  const volumeAdjust = (1.0 + (rng() - 0.5) * 0.02).toFixed(3); // 0.99-1.01
+  audioFilters.push(`volume=${volumeAdjust}`);
+  
+  // Occasionally add imperceptible highpass filter (varies frequency spectrum)
+  if (rng() > 0.5) {
+    audioFilters.push('highpass=f=20'); // Remove <20Hz (inaudible but changes hash)
+  }
+
+  const af = audioFilters.join(',');
+
+  console.log(
+    `[FFmpeg L1] clip ${clipIndex}: contrast=${contrast}, sat=${saturation}, bright=${brightness}, noise=${noiseStrength}, crf=${crf}, preset=${preset}, duration=+${startPadMs + endPadMs}ms, audio=${af}`
+  );
+
+  // ANTI-SHADOWBAN: Randomize metadata (creation_time varies per clip)
+  const randomDaysAgo = Math.floor(rng() * 30); // 0-30 days ago
+  const creationTime = new Date(Date.now() - randomDaysAgo * 24 * 60 * 60 * 1000).toISOString();
 
   const baseArgs = [
     "-y",
@@ -622,6 +757,8 @@ function runFfmpegLevel1({ inputPath, outPath }) {
     inputPath,
     "-vf",
     vf,
+    "-af", // Audio filters (prevents audio fingerprinting)
+    af,
     "-c:v",
     "libx264",
     "-profile:v",
@@ -629,13 +766,17 @@ function runFfmpegLevel1({ inputPath, outPath }) {
     "-pix_fmt",
     "yuv420p",
     "-preset",
-    "superfast",
+    preset,
     "-crf",
-    "23",
+    String(crf),
     "-threads",
     "2",
     "-movflags",
     "+faststart",
+    "-metadata",
+    `creation_time=${creationTime}`,
+    "-metadata",
+    `title=`,
   ];
 
   function spawnFfmpeg(args) {
@@ -653,11 +794,11 @@ function runFfmpegLevel1({ inputPath, outPath }) {
     });
   }
 
-  // Try to copy audio (fast). If it fails (weird inputs), fallback to AAC.
-  const tryCopyAudio = [...baseArgs, "-c:a", "copy", outPath];
-  const fallbackAac = [...baseArgs, "-c:a", "aac", "-b:a", "128k", outPath];
+  // Audio encoding with variation (NOT copy - prevents audio fingerprinting)
+  const audioArgs = ["-c:a", "aac", "-b:a", "128k", outPath];
+  const finalArgs = [...baseArgs, ...audioArgs];
 
-  return spawnFfmpeg(tryCopyAudio).catch(() => spawnFfmpeg(fallbackAac));
+  return spawnFfmpeg(finalArgs);
 }
 
 function withTimeout(promise, ms, label) {
